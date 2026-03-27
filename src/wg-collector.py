@@ -25,7 +25,9 @@ from psycopg2.extras import execute_batch, RealDictCursor
 # КОНСТАНТЫ И АЛИАСЫ ТИПОВ
 # =============================================================================
 
-WG_SUPPORTED_CONTAINERS: Final[frozenset[str]] = frozenset({"wg-easy", "amnezia-awg"})
+WG_SUPPORTED_TYPES: Final[frozenset[str]] = frozenset({"wireguard", "amnezia"})
+WG_CONFIG_PATH_WIREGUARD: Final[str] = "/etc/wireguard/wg0.conf"
+WG_CONFIG_PATH_AMNEZIA: Final[str] = "/opt/amnezia/awg/clientsTable"
 WG_INTERFACE: Final[str] = "wg0"
 DB_HOST: Final[str] = "127.0.0.1"
 DB_PORT: Final[int] = 5432
@@ -49,28 +51,24 @@ class Config:
     """Конфигурация приложения из переменных окружения."""
     
     wg_container: str
+    wg_type:str
     postgres_db: str
     postgres_user: str
     postgres_password: str
-    wg_config_path: str
     interval_seconds: int = DEFAULT_INTERVAL_SECONDS
     
     @classmethod
     def from_env(cls) -> "Config":
         """Создать конфигурацию из переменных окружения с валидацией."""
         wg_container = os.getenv("WG_CONTAINER")
+        wg_type = os.getenv("WG_TYPE", "").lower()
         
         if not wg_container:
             raise ValueError("Переменная окружения WG_CONTAINER обязательна")
-        if wg_container not in WG_SUPPORTED_CONTAINERS:
+        if wg_type not in WG_SUPPORTED_TYPES:
             raise ValueError(
-                f"WG_CONTAINER должен быть одним из {WG_SUPPORTED_CONTAINERS}, получено: {WG_CONTAINER!r}"
+                f"WG_TYPE должен быть одним из {WG_SUPPORTED_TYPES}, получено: {wg_type!r}"
             )
-        
-        if wg_container == "wg-easy":
-            wg_config_path = "/etc/wireguard/wg0.conf"
-        else:
-            wg_config_path = "/opt/amnezia/awg/wg0.conf"
 
         required_vars = ["POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"]
         missing = [var for var in required_vars if not os.getenv(var)]
@@ -87,12 +85,18 @@ class Config:
         
         return cls(
             wg_container=wg_container,
-            wg_config_path=wg_config_path,
+            wg_type=wg_type,
             postgres_db=os.getenv("POSTGRES_DB", ""),
             postgres_user=os.getenv("POSTGRES_USER", ""),
             postgres_password=os.getenv("POSTGRES_PASSWORD", ""),
             interval_seconds=interval,
         )
+
+    def get_config_path(self) -> str:
+        """Вернуть путь к конфигурационному файлу в зависимости от типа WG."""
+        if self.wg_type == "amnezia":
+            return WG_CONFIG_PATH_AMNEZIA
+        return WG_CONFIG_PATH_WIREGUARD
 
 
 class UserStats(NamedTuple):
@@ -188,13 +192,76 @@ def parse_wireguard_config(config_text: str) -> dict[PublicKey, UserName]:
     return users
 
 
+def parse_amnezia_config(config_text: str) -> dict[PublicKey, UserName]:
+    """
+    Распарсить конфигурационный файл Amnezia WireGuard (JSON формат).
+    
+    Ожидаемый формат JSON:
+    [
+        {
+            "clientId": "публичный_ключ",
+            "userData": {
+                "clientName": "имя_пользователя",
+                ...
+            }
+        },
+        ...
+    ]
+    """
+    users: dict[PublicKey, UserName] = {}
+    
+    try:
+        clients = json.loads(config_text)
+        
+        if not isinstance(clients, list):
+            logger.warning("Amnezia config: ожидается список клиентов")
+            return users
+        
+        for idx, client in enumerate(clients):
+            if not isinstance(client, dict):
+                logger.warning(f"Amnezia config: клиент {idx} не является объектом")
+                continue
+            
+            client_id = client.get("clientId")
+            user_data = client.get("userData", {})
+            
+            if not client_id:
+                logger.warning(f"Amnezia config: клиент {idx} не имеет clientId")
+                continue
+            
+            if not isinstance(user_data, dict):
+                logger.warning(f"Amnezia config: клиент {idx} не имеет userData")
+                continue
+            
+            client_name = user_data.get("clientName")
+            
+            if not client_name:
+                logger.warning(f"Amnezia config: клиент {idx} не имеет clientName")
+                continue
+            
+            users[client_id] = client_name
+        
+        logger.info(f"Amnezia config: найдено {len(users)} пользователей")
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"Amnezia config: ошибка парсинга JSON: {e}")
+    
+    return users
+
+
 def get_users(config: Config) -> dict[PublicKey, UserName]:
     """Получить и распарсить конфигурацию WireGuard для получения сопоставления пользователей."""
+    config_path = config.get_config_path()
+    
     try:
         output = _execute_docker_command(
-            config.wg_container, "cat", config.wg_config_path
+            config.wg_container, "cat", config_path
         )
-        return parse_wireguard_config(output)
+        
+        if config.wg_type == "amnezia":
+            return parse_amnezia_config(output)
+        else:
+            return parse_wireguard_config(output)
     except subprocess.SubprocessError as e:
         logger.error(f"Не удалось получить конфигурацию WireGuard: {e}")
         return {}
