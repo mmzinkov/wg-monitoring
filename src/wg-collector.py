@@ -6,6 +6,7 @@
 с поддержкой месячного партиционирования.
 """
 
+import json
 import logging
 import os
 import subprocess
